@@ -5,8 +5,6 @@ jobs:
     runs-on: windows-latest
     steps:
     - uses: actions/checkout@v4
-    - name: Configurar CMake
-      uses: lukka/get-cmake@latest
     - name: Clonar JUCE
       run: git clone https://github.com/juce-framework/JUCE.git --depth 1
     - name: Configurar y Compilar

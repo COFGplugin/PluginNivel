@@ -1,184 +1,1245 @@
-#include <JuceHeader.h>
+// NivelPlugin - VST3 mono, nivelacion de volumen por secciones (clip gain).
+#include <juce_audio_utils/juce_audio_utils.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <initializer_list>
+#include <limits>
+#include <memory>
+#include <utility>
 #include <vector>
 
-// =====================================================================
-// 1. LÓGICA DE AUDIO (PROCESADOR)
-// =====================================================================
-class NivelPluginAudioProcessor : public juce::AudioProcessor
+namespace
+{
+    // Capacidad fija del buffer de captura (muestras). 300 s a 48 kHz.
+    constexpr int64_t kMaxCaptureSamples = 48000LL * 300LL;
+    constexpr int     kMaxSections       = 1024;
+    constexpr float   kSilenceFloor      = 1.0e-4f;   // -80 dBFS: por debajo no se toca
+    constexpr int64_t kNoPlayhead        = std::numeric_limits<int64_t>::min();
+    constexpr int     kRulerH            = 18;
+
+    juce::String T (const char* utf8) { return juce::String::fromUTF8 (utf8); }
+
+    //==========================================================================
+    struct GainMap
+    {
+        int     count  = 0;
+        int64_t length = 0;
+        int64_t minLen = 0;
+        int64_t start[kMaxSections] {};
+        float   gain[kMaxSections]  {};
+    };
+
+    // Ganancia lineal en la muestra t (relativa al inicio de la captura).
+    // Constante dentro de cada seccion; rampa lineal de 'fade' muestras
+    // centrada en cada corte.
+    inline float gainAt (const GainMap& m, int64_t t, int64_t fade) noexcept
+    {
+        if (m.count <= 0 || t < 0 || t >= m.length)
+            return 1.0f;
+
+        int lo = 0, hi = m.count - 1;
+        while (lo < hi)
+        {
+            const int mid = (lo + hi + 1) / 2;
+            if (m.start[mid] <= t) lo = mid; else hi = mid - 1;
+        }
+
+        const float g = m.gain[lo];
+
+        if (fade > 1)
+        {
+            const int64_t half = fade / 2;
+
+            if (lo > 0)
+            {
+                const int64_t d = t - (m.start[lo] - half);
+                if (d >= 0 && d < fade)
+                {
+                    const float f  = ((float) d + 0.5f) / (float) fade;
+                    const float gp = m.gain[lo - 1];
+                    return gp + (g - gp) * f;
+                }
+            }
+
+            if (lo + 1 < m.count)
+            {
+                const int64_t d = t - (m.start[lo + 1] - half);
+                if (d >= 0 && d < fade)
+                {
+                    const float f  = ((float) d + 0.5f) / (float) fade;
+                    const float gn = m.gain[lo + 1];
+                    return g + (gn - g) * f;
+                }
+            }
+        }
+        return g;
+    }
+}
+
+//==============================================================================
+class NivelPluginEditor;
+
+class NivelPluginProcessor : public juce::AudioProcessor
 {
 public:
-    NivelPluginAudioProcessor() : AudioProcessor(BusesProperties()
-        .withInput("Input", juce::AudioChannelSet::mono(), true)
-        .withOutput("Output", juce::AudioChannelSet::mono(), true)) {}
-
-    ~NivelPluginAudioProcessor() override {}
-
-    void prepareToPlay(double sampleRate, int samplesPerBlock) override
+    NivelPluginProcessor()
+        : AudioProcessor (BusesProperties()
+                              .withInput  ("Input",  juce::AudioChannelSet::mono(), true)
+                              .withOutput ("Output", juce::AudioChannelSet::mono(), true)),
+          apvts (*this, nullptr, "STATE", createLayout())
     {
-        bufferInterno.setSize(1, (int)(sampleRate * 300));
-        bufferInterno.clear();
-        posicionEscritura = 0;
-        waveformData.clear();
-        grabandoBuffer = false;
+        capture.assign ((size_t) kMaxCaptureSamples, 0.0f);
+
+        targetParam    = apvts.getRawParameterValue ("target");
+        fadeParam      = apvts.getRawParameterValue ("fade");
+        zeroCrossParam = apvts.getRawParameterValue ("zerocross");
+        threshParam    = apvts.getRawParameterValue ("silthresh");
+        minSilParam    = apvts.getRawParameterValue ("minsil");
+        applyParam     = apvts.getRawParameterValue ("apply");
+    }
+
+    //==========================================================================
+    static juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
+    {
+        using namespace juce;
+        AudioProcessorValueTreeState::ParameterLayout layout;
+
+        layout.add (std::make_unique<AudioParameterFloat> (
+            ParameterID { "target", 1 }, "Nivel Objetivo",
+            NormalisableRange<float> (-60.0f, 0.0f, 0.1f), -18.0f,
+            AudioParameterFloatAttributes().withLabel ("dBFS")));
+
+        layout.add (std::make_unique<AudioParameterFloat> (
+            ParameterID { "fade", 1 }, "Crossfade",
+            NormalisableRange<float> (0.0f, 5.0f, 0.1f), 5.0f,
+            AudioParameterFloatAttributes().withLabel ("ms")));
+
+        layout.add (std::make_unique<AudioParameterBool> (
+            ParameterID { "zerocross", 1 }, "Cortes en cruce por cero", true));
+
+        layout.add (std::make_unique<AudioParameterFloat> (
+            ParameterID { "silthresh", 1 }, "Umbral de silencio",
+            NormalisableRange<float> (-90.0f, -10.0f, 1.0f), -40.0f,
+            AudioParameterFloatAttributes().withLabel ("dBFS")));
+
+        layout.add (std::make_unique<AudioParameterFloat> (
+            ParameterID { "minsil", 1 }, "Silencio minimo",
+            NormalisableRange<float> (20.0f, 1000.0f, 10.0f), 150.0f,
+            AudioParameterFloatAttributes().withLabel ("ms")));
+
+        layout.add (std::make_unique<AudioParameterBool> (
+            ParameterID { "apply", 1 }, "Aplicar ganancia", true));
+
+        return layout;
+    }
+
+    //==========================================================================
+    void prepareToPlay (double sampleRate, int) override
+    {
+        currentSR.store (sampleRate);
+        const double csr = captureSR.load();
+        if (csr > 0.0 && std::abs (csr - sampleRate) > 0.5)
+            clearAll();
     }
 
     void releaseResources() override {}
-    bool isBusesLayoutSupported(const BusesLayout& layouts) const override { return true; }
-    
-    void processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages) override
+
+    bool isBusesLayoutSupported (const BusesLayout& l) const override
+    {
+        return l.getMainInputChannelSet()  == juce::AudioChannelSet::mono()
+            && l.getMainOutputChannelSet() == juce::AudioChannelSet::mono();
+    }
+
+    //==========================================================================
+    void processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) override
     {
         juce::ScopedNoDenormals noDenormals;
-        if (grabandoBuffer && posicionEscritura + buffer.getNumSamples() < bufferInterno.getNumSamples())
+
+        const int n = buffer.getNumSamples();
+        if (buffer.getNumChannels() < 1 || n <= 0)
+            return;
+
+        for (int ch = 1; ch < buffer.getNumChannels(); ++ch)
+            buffer.clear (ch, 0, n);
+
+        float* data = buffer.getWritePointer (0);
+
+        // --- posicion del host ---
+        int64_t hostPos = 0;
+        bool havePos = false, playing = false;
+
+        if (auto* ph = getPlayHead())
         {
-            bufferInterno.copyFrom(0, posicionEscritura, buffer, 0, 0, buffer.getNumSamples());
-            posicionEscritura += buffer.getNumSamples();
+            const auto infoOpt = ph->getPosition();
+            if (infoOpt.hasValue())
+            {
+                const auto& info = *infoOpt;
+                playing = info.getIsPlaying();
+                const auto t = info.getTimeInSamples();
+                if (t.hasValue())
+                {
+                    hostPos = *t;
+                    havePos = true;
+                }
+            }
+        }
+
+        playheadIdx.store ((havePos && hasStart.load()) ? hostPos - captureStartHost.load()
+                                                        : kNoPlayhead);
+
+        // --- CAPTURA (el audio pasa sin modificar) ---
+        if (capturing.load())
+        {
+            int64_t idx = 0;
+            bool canWrite = false;
+
+            if (havePos)
+            {
+                if (playing)
+                {
+                    if (! hasStart.load())
+                    {
+                        captureStartHost.store (hostPos);
+                        hasStart.store (true);
+                    }
+                    idx = hostPos - captureStartHost.load();
+                    canWrite = true;
+                }
+            }
+            else
+            {
+                idx = seqPos.load();
+                seqPos.store (idx + n);
+                canWrite = true;
+            }
+
+            if (canWrite)
+            {
+                float* cap = capture.data();
+                for (int i = 0; i < n; ++i)
+                {
+                    const int64_t j = idx + i;
+                    if (j >= 0 && j < kMaxCaptureSamples)
+                        cap[j] = data[i];
+                }
+
+                const int64_t end = std::min<int64_t> (idx + n, kMaxCaptureSamples);
+                if (end > captureLen.load())
+                    captureLen.store (end);
+
+                if (idx + n >= kMaxCaptureSamples)
+                    capturing.store (false);
+            }
+            return;
+        }
+
+        // --- REPRODUCCION: solo multiplicacion por ganancia ---
+        if (applyParam->load() < 0.5f)
+            return;
+        if (! havePos || ! playing || ! hasStart.load())
+            return;
+
+        const uint32_t v = mapVersion.load (std::memory_order_acquire);
+        if (v != cachedVersion)
+        {
+            const juce::SpinLock::ScopedTryLockType lock (mapLock);
+            if (lock.isLocked())
+            {
+                cachedMap = sharedMap;
+                cachedVersion = v;
+            }
+        }
+
+        if (cachedMap.count <= 0)
+            return;
+
+        const int64_t base = hostPos - captureStartHost.load();
+        if (base + n <= 0 || base >= cachedMap.length)
+            return;
+
+        const int64_t fade = std::min<int64_t> (
+            cachedMap.minLen,
+            (int64_t) std::llround ((double) fadeParam->load() * 0.001 * currentSR.load()));
+
+        const bool useBuffer = bufferValid.load();
+        const float* cap = capture.data();
+
+        for (int i = 0; i < n; ++i)
+        {
+            const int64_t j = base + i;
+            const float g = gainAt (cachedMap, j, fade);
+
+            if (useBuffer && j >= 0 && j < cachedMap.length)
+                data[i] = cap[j] * g;     // reproduce lo capturado
+            else
+                data[i] *= g;             // fuera de la captura / audio no guardado
         }
     }
 
-    void analizarAudio()
+    //==========================================================================
+    // Acciones de la GUI (hilo de mensajes)
+    void startCapture()
     {
-        waveformData.clear();
-        int numSamples = posicionEscritura;
-        if (numSamples == 0) return;
-
-        // TU LÓGICA EXACTA: Buscar el pico máximo
-        float picoMaximo = 0.0f;
-        for (int i = 0; i < numSamples; ++i)
-        {
-            float muestra = std::abs(bufferInterno.getSample(0, i));
-            if (muestra > picoMaximo) picoMaximo = muestra;
-        }
-
-        if (picoMaximo > 0.0f)
-        {
-            // Calcular dB y aplicar ganancia
-            float picoDBFS = juce::Decibels::gainToDecibels(picoMaximo);
-            float gananciaDB = nivelObjetivoDB - picoDBFS;
-            float gananciaLineal = juce::Decibels::decibelsToGain(gananciaDB);
-            bufferInterno.applyGain(0, 0, numSamples, gananciaLineal);
-        }
-
-        // Preparar datos para la onda visual
-        for (int i = 0; i < 800; ++i)
-        {
-            int index = (i * numSamples) / 800;
-            waveformData.push_back(bufferInterno.getSample(0, index));
-        }
+        capturing.store (false);
+        captureLen.store (0);
+        hasStart.store (false);
+        seqPos.store (0);
+        cuts.clear();
+        cutsDirty = false;
+        setGainMap (GainMap(), false);
+        std::fill (capture.begin(), capture.end(), 0.0f);
+        captureSR.store (currentSR.load());
+        bufferValid.store (true);
+        ++revision;
+        capturing.store (true);
     }
 
+    void stopCapture()
+    {
+        capturing.store (false);
+        ++revision;
+    }
+
+    void clearAll()
+    {
+        capturing.store (false);
+        captureLen.store (0);
+        hasStart.store (false);
+        seqPos.store (0);
+        cuts.clear();
+        cutsDirty = false;
+        setGainMap (GainMap(), false);
+        std::fill (capture.begin(), capture.end(), 0.0f);
+        bufferValid.store (false);
+        captureSR.store (0.0);
+        ++revision;
+    }
+
+    bool analyze()
+    {
+        if (! bufferValid.load())
+            return false;
+
+        stopCapture();
+        const int64_t len = captureLen.load();
+        if (len <= 0)
+            return false;
+
+        if (zeroCrossParam->load() > 0.5f)
+            for (auto& c : cuts)
+                c = snapToZeroCrossing (c);
+
+        normaliseCuts (len);
+
+        std::vector<int64_t> b;
+        b.push_back (0);
+        b.insert (b.end(), cuts.begin(), cuts.end());
+        b.push_back (len);
+
+        GainMap m;
+        m.length = len;
+        m.count  = (int) b.size() - 1;
+        m.minLen = len;
+
+        const double targetLin = juce::Decibels::decibelsToGain ((double) targetParam->load());
+
+        for (int k = 0; k < m.count; ++k)
+        {
+            const int64_t s = b[(size_t) k], e = b[(size_t) k + 1];
+
+            float peak = 0.0f;                       // pico maximo absoluto
+            for (int64_t j = s; j < e; ++j)
+                peak = std::max (peak, std::abs (capture[(size_t) j]));
+
+            m.start[k] = s;
+            m.gain[k]  = (peak > kSilenceFloor) ? (float) (targetLin / (double) peak) : 1.0f;
+            m.minLen   = std::min (m.minLen, e - s);
+        }
+
+        setGainMap (m, true);
+        cutsDirty = false;
+        ++revision;
+        return true;
+    }
+
+    void autoSplit()
+    {
+        if (! bufferValid.load())
+            return;
+
+        stopCapture();
+        const int64_t len = captureLen.load();
+        const double  sr  = currentSR.load();
+        const int64_t win = std::max<int64_t> (16, (int64_t) (0.020 * sr));
+        const int64_t hop = std::max<int64_t> (8, win / 2);
+        if (len < win * 4)
+            return;
+
+        const float thr = (float) juce::Decibels::decibelsToGain ((double) threshParam->load());
+        const int minRun = std::max (1, (int) std::llround ((double) minSilParam->load() * 0.001 * sr / (double) hop));
+
+        std::vector<float> env;
+        env.reserve ((size_t) (len / hop) + 1);
+        for (int64_t p = 0; p + win <= len; p += hop)
+        {
+            double acc = 0.0;
+            for (int64_t j = p; j < p + win; ++j)
+            {
+                const double x = (double) capture[(size_t) j];
+                acc += x * x;
+            }
+            env.push_back ((float) std::sqrt (acc / (double) win));
+        }
+
+        std::vector<int64_t> found;
+        int runStart = -1;
+        for (size_t i = 0; i <= env.size(); ++i)
+        {
+            const bool silent = (i < env.size()) && env[i] < thr;
+            if (silent)
+            {
+                if (runStart < 0) runStart = (int) i;
+            }
+            else if (runStart >= 0)
+            {
+                const int runEnd = (int) i - 1;
+                const int runLen = runEnd - runStart + 1;
+                if (runLen >= minRun && runStart > 0 && i < env.size())
+                    found.push_back ((int64_t) ((runStart + runEnd) / 2) * hop + win / 2);
+                runStart = -1;
+            }
+        }
+
+        cuts = std::move (found);
+        if (zeroCrossParam->load() > 0.5f)
+            for (auto& c : cuts)
+                c = snapToZeroCrossing (c);
+
+        normaliseCuts (len);
+        cutsDirty = true;
+        ++revision;
+    }
+
+    void addCut (int64_t pos)
+    {
+        const int64_t len = captureLen.load();
+        if (pos <= 0 || pos >= len || (int) cuts.size() >= kMaxSections - 1)
+            return;
+        cuts.push_back (pos);
+        std::sort (cuts.begin(), cuts.end());
+        cutsDirty = true;
+        ++revision;
+    }
+
+    void removeCut (int i)
+    {
+        if (i < 0 || i >= (int) cuts.size())
+            return;
+        cuts.erase (cuts.begin() + i);
+        cutsDirty = true;
+        ++revision;
+    }
+
+    void moveCut (int i, int64_t pos)
+    {
+        if (i < 0 || i >= (int) cuts.size())
+            return;
+        const int64_t len = captureLen.load();
+        const int64_t lo = (i > 0 ? cuts[(size_t) i - 1] : 0) + 1;
+        const int64_t hi = (i + 1 < (int) cuts.size() ? cuts[(size_t) i + 1] : len) - 1;
+        if (hi < lo)
+            return;
+        cuts[(size_t) i] = juce::jlimit (lo, hi, pos);
+        cutsDirty = true;
+        ++revision;
+    }
+
+    void snapCut (int i)
+    {
+        if (i < 0 || i >= (int) cuts.size() || zeroCrossParam->load() < 0.5f)
+            return;
+        const int64_t len = captureLen.load();
+        const int64_t lo = (i > 0 ? cuts[(size_t) i - 1] : 0) + 1;
+        const int64_t hi = (i + 1 < (int) cuts.size() ? cuts[(size_t) i + 1] : len) - 1;
+        if (hi < lo)
+            return;
+        cuts[(size_t) i] = juce::jlimit (lo, hi, snapToZeroCrossing (cuts[(size_t) i]));
+        ++revision;
+    }
+
+    int64_t snapIfEnabled (int64_t pos) const
+    {
+        return zeroCrossParam->load() > 0.5f ? snapToZeroCrossing (pos) : pos;
+    }
+
+    //==========================================================================
+    // Acceso de solo lectura para la GUI
+    const std::vector<float>& getCapture() const noexcept { return capture; }
+    int64_t  getCaptureLength() const noexcept { return captureLen.load(); }
+    bool     isCapturing()      const noexcept { return capturing.load(); }
+    bool     isBufferValid()    const noexcept { return bufferValid.load(); }
+    bool     isAnalyzed()       const noexcept { return analyzed.load(); }
+    bool     areCutsDirty()     const noexcept { return cutsDirty; }
+    int64_t  getPlayheadIndex() const noexcept { return playheadIdx.load(); }
+    uint32_t getRevision()      const noexcept { return revision.load(); }
+    double   getSampleRate()    const noexcept { return currentSR.load(); }
+    float    getFadeMs()        const noexcept { return fadeParam->load(); }
+    std::vector<int64_t> getCuts() const { return cuts; }
+
+    GainMap getGainMapCopy() const
+    {
+        const juce::SpinLock::ScopedLockType lock (mapLock);
+        return sharedMap;
+    }
+
+    //==========================================================================
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
+
     const juce::String getName() const override { return "NivelPlugin"; }
-    bool acceptsMidi() const override { return false; }
+    bool acceptsMidi() const override  { return false; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
     double getTailLengthSeconds() const override { return 0.0; }
+
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
-    void setCurrentProgram(int index) override {}
-    const juce::String getProgramName(int index) override { return {}; }
-    void changeProgramName(int index, const juce::String& newName) override {}
-    void getStateInformation(juce::MemoryBlock& destData) override {}
-    void setStateInformation(const void* data, int sizeInBytes) override {}
+    void setCurrentProgram (int) override {}
+    const juce::String getProgramName (int) override { return {}; }
+    void changeProgramName (int, const juce::String&) override {}
 
-    std::vector<float> waveformData;
-    float nivelObjetivoDB = -18.0f;
-    bool grabandoBuffer = false;
-    juce::AudioBuffer<float> bufferInterno;
-    int posicionEscritura = 0;
-};
-
-// =====================================================================
-// 2. INTERFAZ GRÁFICA (EDITOR)
-// =====================================================================
-class NivelPluginAudioProcessorEditor : public juce::AudioProcessorEditor, public juce::Timer
-{
-public:
-    NivelPluginAudioProcessorEditor(NivelPluginAudioProcessor& p)
-        : AudioProcessorEditor(&p), audioProcessor(p)
+    //==========================================================================
+    void getStateInformation (juce::MemoryBlock& dest) override
     {
-        setSize(800, 400); // Ventana del tamaño que pediste
+        auto state = apvts.copyState();
 
-        addAndMakeVisible(botonGrabar);
-        botonGrabar.onClick = [this]() {
-            audioProcessor.grabandoBuffer = !audioProcessor.grabandoBuffer;
-            botonGrabar.setButtonText(audioProcessor.grabandoBuffer ? "Detener Captura" : "Capturar Audio");
-            if (!audioProcessor.grabandoBuffer) {
-                audioProcessor.analizarAudio();
-                repaint();
-            }
-        };
+        if (analyzed.load())
+        {
+            const auto m = getGainMapCopy();
+            juce::String s;
+            for (int k = 0; k < m.count; ++k)
+                s << juce::String ((juce::int64) m.start[k]) << ":"
+                  << juce::String ((double) m.gain[k], 9) << ";";
 
-        addAndMakeVisible(botonAnalizar);
-        botonAnalizar.onClick = [this]() {
-            audioProcessor.analizarAudio();
-            repaint();
-        };
+            state.setProperty ("gmap",   s, nullptr);
+            state.setProperty ("glen",   (juce::int64) m.length, nullptr);
+            state.setProperty ("cstart", (juce::int64) captureStartHost.load(), nullptr);
+            state.setProperty ("csr",    captureSR.load(), nullptr);
+        }
 
-        addAndMakeVisible(sliderObjetivo);
-        sliderObjetivo.setRange(-40.0, 0.0, 0.1);
-        sliderObjetivo.setValue(-18.0);
-        sliderObjetivo.setTextBoxStyle(juce::Slider::TextBoxRight, false, 60, 20);
-        
-        addAndMakeVisible(labelObjetivo);
-        labelObjetivo.setText("Nivel Objetivo (dBFS):", juce::dontSendNotification);
-
-        startTimerHz(30);
+        if (auto xml = state.createXml())
+            copyXmlToBinary (*xml, dest);
     }
 
-    ~NivelPluginAudioProcessorEditor() override {}
-
-    void paint(juce::Graphics& g) override
+    void setStateInformation (const void* data, int size) override
     {
-        g.fillAll(juce::Colours::black);
+        std::unique_ptr<juce::XmlElement> xml (getXmlFromBinary (data, size));
+        if (xml == nullptr || ! xml->hasTagName (apvts.state.getType()))
+            return;
 
-        auto bounds = getLocalBounds().reduced(10);
-        bounds.removeFromTop(50);
+        const auto vt = juce::ValueTree::fromXml (*xml);
+        apvts.replaceState (vt);
 
-        g.setColour(juce::Colours::cyan);
-        if (audioProcessor.waveformData.size() > 0)
+        const juce::String s = vt.getProperty ("gmap").toString();
+        if (s.isEmpty())
+            return;
+
+        GainMap m;
+        m.length = (int64_t) (juce::int64) vt.getProperty ("glen", 0);
+
+        for (const auto& tok : juce::StringArray::fromTokens (s, ";", ""))
         {
-            juce::Path path;
-            path.startNewSubPath(bounds.getX(), bounds.getCentreY());
-            for (size_t i = 0; i < audioProcessor.waveformData.size(); ++i)
+            const auto kv = juce::StringArray::fromTokens (tok, ":", "");
+            if (kv.size() == 2 && m.count < kMaxSections)
             {
-                float x = bounds.getX() + (i * bounds.getWidth() / audioProcessor.waveformData.size());
-                float y = bounds.getCentreY() - (audioProcessor.waveformData[i] * bounds.getHeight() / 2.0f);
-                path.lineTo(x, y);
+                m.start[m.count] = (int64_t) kv[0].getLargeIntValue();
+                m.gain[m.count]  = (float) kv[1].getDoubleValue();
+                ++m.count;
             }
-            g.strokePath(path, juce::PathStrokeType(1.5f));
         }
+
+        if (m.count <= 0 || m.length <= 0)
+            return;
+
+        m.minLen = m.length;
+        for (int k = 0; k < m.count; ++k)
+        {
+            const int64_t e = (k + 1 < m.count) ? m.start[k + 1] : m.length;
+            m.minLen = std::min (m.minLen, e - m.start[k]);
+        }
+
+        capturing.store (false);
+        captureLen.store (m.length);
+        captureStartHost.store ((int64_t) (juce::int64) vt.getProperty ("cstart", 0));
+        hasStart.store (true);
+        captureSR.store ((double) vt.getProperty ("csr", 0.0));
+        bufferValid.store (false);   // el audio original no se guarda en el proyecto
+
+        cuts.clear();
+        for (int k = 1; k < m.count; ++k)
+            cuts.push_back (m.start[k]);
+
+        setGainMap (m, true);
+        cutsDirty = false;
+        ++revision;
+    }
+
+    juce::AudioProcessorValueTreeState apvts;
+
+private:
+    void setGainMap (const GainMap& m, bool isAnalyzed)
+    {
+        {
+            const juce::SpinLock::ScopedLockType lock (mapLock);
+            sharedMap = m;
+            mapVersion.fetch_add (1, std::memory_order_release);
+        }
+        analyzed.store (isAnalyzed);
+    }
+
+    int64_t snapToZeroCrossing (int64_t idx) const
+    {
+        const int64_t len = captureLen.load();
+        const int64_t win = std::max<int64_t> (1, (int64_t) (0.010 * currentSR.load()));
+        const float* c = capture.data();
+
+        auto crosses = [c, len] (int64_t i)
+        {
+            if (i < 0 || i + 1 >= len)
+                return false;
+            return (c[i] <= 0.0f && c[i + 1] > 0.0f) || (c[i] >= 0.0f && c[i + 1] < 0.0f);
+        };
+
+        for (int64_t d = 0; d <= win; ++d)
+        {
+            if (crosses (idx + d)) return idx + d + 1;
+            if (crosses (idx - d)) return idx - d + 1;
+        }
+        return idx;
+    }
+
+    void normaliseCuts (int64_t len)
+    {
+        const int64_t minGap = std::max<int64_t> (1, (int64_t) (0.010 * currentSR.load()));
+        std::sort (cuts.begin(), cuts.end());
+
+        std::vector<int64_t> out;
+        int64_t last = 0;
+        for (const auto c : cuts)
+        {
+            if (c - last >= minGap && len - c >= minGap && (int) out.size() < kMaxSections - 1)
+            {
+                out.push_back (c);
+                last = c;
+            }
+        }
+        cuts = std::move (out);
+    }
+
+    //==========================================================================
+    std::vector<float> capture;
+    std::vector<int64_t> cuts;      // cortes interiores (solo hilo de mensajes)
+    bool cutsDirty = false;
+
+    std::atomic<bool>     capturing { false };
+    std::atomic<bool>     bufferValid { false };
+    std::atomic<bool>     analyzed { false };
+    std::atomic<bool>     hasStart { false };
+    std::atomic<int64_t>  captureLen { 0 };
+    std::atomic<int64_t>  captureStartHost { 0 };
+    std::atomic<int64_t>  seqPos { 0 };
+    std::atomic<int64_t>  playheadIdx { kNoPlayhead };
+    std::atomic<double>   currentSR { 48000.0 };
+    std::atomic<double>   captureSR { 0.0 };
+    std::atomic<uint32_t> revision { 0 };
+    std::atomic<uint32_t> mapVersion { 0 };
+
+    mutable juce::SpinLock mapLock;
+    GainMap sharedMap;
+    GainMap cachedMap;              // copia usada solo por el hilo de audio
+    uint32_t cachedVersion = 0;
+
+    std::atomic<float>* targetParam    = nullptr;
+    std::atomic<float>* fadeParam      = nullptr;
+    std::atomic<float>* zeroCrossParam = nullptr;
+    std::atomic<float>* threshParam    = nullptr;
+    std::atomic<float>* minSilParam    = nullptr;
+    std::atomic<float>* applyParam     = nullptr;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (NivelPluginProcessor)
+};
+
+//==============================================================================
+class WaveformView : public juce::Component, private juce::Timer
+{
+public:
+    explicit WaveformView (NivelPluginProcessor& p) : proc (p)
+    {
+        viewSpan = proc.getSampleRate() * 2.0;
+        startTimerHz (30);
+    }
+
+    ~WaveformView() override { stopTimer(); }
+
+    // Zoom horizontal (eje X)
+    void zoomIn()  { zoomBy (0.5, viewStart + viewSpan * 0.5); }
+    void zoomOut() { zoomBy (2.0, viewStart + viewSpan * 0.5); }
+
+    void fitView()
+    {
+        autoFit   = true;
+        viewStart = 0.0;
+        viewSpan  = std::max ((double) proc.getCaptureLength(), proc.getSampleRate() * 2.0);
+        cacheDirty = true;
+    }
+
+    //==========================================================================
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (juce::Colour (0xff15181c));
+
+        auto bounds = getLocalBounds();
+        const auto ruler = bounds.removeFromTop (kRulerH);
+        const auto area  = bounds;
+
+        drawRuler (g, ruler);
+
+        g.setColour (juce::Colour (0xff1b1f25));
+        g.fillRect (area);
+        g.setColour (juce::Colour (0xff2c323b));
+        g.drawHorizontalLine (area.getCentreY(), 0.0f, (float) area.getWidth());
+
+        const int64_t len = proc.getCaptureLength();
+        const bool valid  = proc.isBufferValid();
+
+        if (len > 0 && valid && area.getWidth() > 0 && area.getHeight() > 0)
+        {
+            if (cacheDirty || cache.getWidth() != area.getWidth() || cache.getHeight() != area.getHeight())
+                rebuildCache (area.getWidth(), area.getHeight());
+            g.drawImageAt (cache, area.getX(), area.getY());
+        }
+        else
+        {
+            g.setColour (juce::Colour (0xff7d8794));
+            g.setFont (15.0f);
+            if (len <= 0)
+                g.drawText (T ("Pulsa «Capturar Audio» y reproduce la pista en el DAW"),
+                            area, juce::Justification::centred);
+            else
+                g.drawText (T ("Audio original no guardado en el proyecto: se conservan cortes y ganancias"),
+                            area, juce::Justification::centred);
+        }
+
+        if (len > 0)
+        {
+            const auto cutsCopy = proc.getCuts();
+            const bool showGains = proc.isAnalyzed() && ! proc.areCutsDirty();
+            const auto map = proc.getGainMapCopy();
+
+            std::vector<int64_t> b;
+            b.push_back (0);
+            b.insert (b.end(), cutsCopy.begin(), cutsCopy.end());
+            b.push_back (len);
+
+            // etiquetas de ganancia por seccion
+            if (showGains && map.count == (int) b.size() - 1)
+            {
+                g.setFont (12.0f);
+                for (int k = 0; k < map.count; ++k)
+                {
+                    const float xs = std::max (0.0f, sampleToX ((double) b[(size_t) k]));
+                    const float xe = std::min ((float) getWidth(), sampleToX ((double) b[(size_t) k + 1]));
+                    if (xe - xs < 56.0f)
+                        continue;
+                    const float db = juce::Decibels::gainToDecibels (map.gain[k]);
+                    g.setColour (juce::Colour (0xffffd166));
+                    g.drawText ((db >= 0 ? "+" : "") + juce::String (db, 1) + " dB",
+                                juce::Rectangle<float> (xs + 6.0f, (float) area.getY() + 2.0f, xe - xs - 8.0f, 14.0f),
+                                juce::Justification::centredLeft, false);
+                }
+            }
+
+            // fin de la captura
+            const float xEnd = sampleToX ((double) len);
+            if (xEnd >= 0.0f && xEnd <= (float) getWidth())
+            {
+                g.setColour (juce::Colour (0xff4a5360));
+                g.drawVerticalLine ((int) xEnd, (float) area.getY(), (float) area.getBottom());
+            }
+
+            // cortes
+            for (const auto c : cutsCopy)
+            {
+                const float x = sampleToX ((double) c);
+                if (x < -6.0f || x > (float) getWidth() + 6.0f)
+                    continue;
+                g.setColour (juce::Colour (0xffff8c42));
+                g.drawVerticalLine ((int) x, (float) area.getY(), (float) area.getBottom());
+                juce::Path tri;
+                tri.addTriangle (x - 5.0f, (float) area.getY(), x + 5.0f, (float) area.getY(),
+                                 x, (float) area.getY() + 8.0f);
+                g.fillPath (tri);
+            }
+        }
+
+        // playhead
+        const int64_t ph = proc.getPlayheadIndex();
+        if (ph != kNoPlayhead)
+        {
+            const float x = sampleToX ((double) ph);
+            if (x >= 0.0f && x <= (float) getWidth())
+            {
+                g.setColour (juce::Colours::white.withAlpha (0.9f));
+                g.fillRect (x - 0.5f, (float) area.getY(), 1.5f, (float) area.getHeight());
+            }
+        }
+
+        // estado
+        juce::String status;
+        const double sr = std::max (1.0, proc.getSampleRate());
+        if (proc.isCapturing())
+            status = T ("● Capturando… ") + juce::String ((double) len / sr, 1) + " s";
+        else if (len > 0)
+        {
+            status = juce::String ((double) len / sr, 1) + " s  |  " + juce::String (proc.getCuts().size() + 1)
+                   + T (" secciones  |  ");
+            status += proc.areCutsDirty() ? T ("cortes sin analizar")
+                                          : (proc.isAnalyzed() ? T ("analizado") : T ("sin analizar"));
+        }
+        g.setColour (proc.isCapturing() ? juce::Colour (0xffff5c5c) : juce::Colour (0xff9aa4b1));
+        g.setFont (12.0f);
+        g.drawText (status, getLocalBounds().withTrimmedTop (kRulerH).removeFromBottom (18).reduced (6, 0),
+                    juce::Justification::centredRight, false);
+    }
+
+    void resized() override { cacheDirty = true; }
+
+    //==========================================================================
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        lastDragX = e.x;
+        dragCut = -1;
+        if (proc.getCaptureLength() <= 0 || ! proc.isBufferValid())
+            return;
+
+        const int k = findCutNear ((float) e.x);
+        if (e.mods.isPopupMenu())
+        {
+            if (k >= 0)
+                proc.removeCut (k);
+            return;
+        }
+        dragCut = k;
+    }
+
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu())
+            return;
+
+        if (dragCut >= 0)
+        {
+            proc.moveCut (dragCut, (int64_t) xToSample ((float) e.x));
+        }
+        else
+        {
+            viewStart -= (double) (e.x - lastDragX) * viewSpan / (double) std::max (1, getWidth());
+            lastDragX = e.x;
+            autoFit = false;
+            clampView();
+        }
+    }
+
+    void mouseUp (const juce::MouseEvent&) override
+    {
+        if (dragCut >= 0)
+            proc.snapCut (dragCut);
+        dragCut = -1;
+    }
+
+    void mouseDoubleClick (const juce::MouseEvent& e) override
+    {
+        if (proc.getCaptureLength() <= 0 || ! proc.isBufferValid())
+            return;
+        proc.addCut (proc.snapIfEnabled ((int64_t) xToSample ((float) e.x)));
+    }
+
+    void mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w) override
+    {
+        if (e.mods.isShiftDown())
+        {
+            viewStart -= (double) w.deltaY * viewSpan * 0.25;
+            autoFit = false;
+            clampView();
+        }
+        else
+        {
+            zoomBy (w.deltaY > 0.0f ? 0.8 : 1.25, (double) xToSample ((float) e.x));
+        }
+    }
+
+private:
+    double xToSample (float x) const
+    {
+        return viewStart + (double) x * viewSpan / (double) std::max (1, getWidth());
+    }
+
+    float sampleToX (double s) const
+    {
+        return (float) ((s - viewStart) * (double) getWidth() / viewSpan);
+    }
+
+    double maxSpan() const
+    {
+        return std::max ((double) proc.getCaptureLength(), proc.getSampleRate() * 2.0);
+    }
+
+    void clampView()
+    {
+        viewSpan  = juce::jlimit (32.0, maxSpan(), viewSpan);
+        viewStart = juce::jlimit (0.0, std::max (0.0, (double) proc.getCaptureLength() - viewSpan), viewStart);
+        cacheDirty = true;
+    }
+
+    void zoomBy (double factor, double anchor)
+    {
+        const double newSpan = juce::jlimit (32.0, maxSpan(), viewSpan * factor);
+        const double frac = (anchor - viewStart) / viewSpan;
+        viewStart = anchor - frac * newSpan;
+        viewSpan  = newSpan;
+        autoFit = false;
+        clampView();
+    }
+
+    int findCutNear (float x) const
+    {
+        const auto c = proc.getCuts();
+        int best = -1;
+        float bestD = 7.0f;
+        for (int i = 0; i < (int) c.size(); ++i)
+        {
+            const float d = std::abs (sampleToX ((double) c[(size_t) i]) - x);
+            if (d < bestD) { bestD = d; best = i; }
+        }
+        return best;
+    }
+
+    void timerCallback() override
+    {
+        const auto rev = proc.getRevision();
+        const auto len = proc.getCaptureLength();
+        const auto fm  = proc.getFadeMs();
+
+        if (autoFit && len != lastLen)
+            fitView();
+
+        if (rev != lastRev || len != lastLen || fm != lastFade)
+        {
+            cacheDirty = true;
+            lastRev = rev;
+            lastLen = len;
+            lastFade = fm;
+        }
+        repaint();
+    }
+
+    void drawRuler (juce::Graphics& g, juce::Rectangle<int> r) const
+    {
+        g.setColour (juce::Colour (0xff22262c));
+        g.fillRect (r);
+
+        const double sr = proc.getSampleRate();
+        if (sr <= 0.0 || getWidth() <= 0)
+            return;
+
+        const double secPerPx = viewSpan / sr / (double) getWidth();
+        static const double steps[] = { 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300 };
+        const int nSteps = (int) (sizeof (steps) / sizeof (steps[0]));
+
+        double step = steps[nSteps - 1];
+        for (int i = 0; i < nSteps; ++i)
+            if (steps[i] / secPerPx >= 70.0) { step = steps[i]; break; }
+
+        const double t0 = viewStart / sr;
+        const double t1 = (viewStart + viewSpan) / sr;
+        const int decimals = step < 0.05 ? 3 : (step < 1.0 ? 2 : 0);
+
+        g.setFont (11.0f);
+        for (double t = std::ceil (t0 / step) * step; t <= t1; t += step)
+        {
+            const float x = (float) ((t * sr - viewStart) / viewSpan * (double) getWidth());
+            g.setColour (juce::Colour (0xff6b7480));
+            g.drawVerticalLine ((int) x, (float) r.getBottom() - 6.0f, (float) r.getBottom());
+            g.setColour (juce::Colour (0xffaab2bd));
+            g.drawText (juce::String (t, decimals) + " s", (int) x + 3, r.getY(), 70, r.getHeight(),
+                        juce::Justification::centredLeft, false);
+        }
+    }
+
+    void rebuildCache (int w, int h)
+    {
+        cache = juce::Image (juce::Image::ARGB, std::max (1, w), std::max (1, h), true);
+        juce::Graphics g (cache);
+
+        const auto& cap = proc.getCapture();
+        const int64_t len = proc.getCaptureLength();
+        const auto map = proc.getGainMapCopy();
+        const bool analyzed = map.count > 0;
+
+        const int64_t fade = std::min<int64_t> (
+            map.minLen,
+            (int64_t) std::llround ((double) proc.getFadeMs() * 0.001 * proc.getSampleRate()));
+
+        const double spp = viewSpan / (double) w;
+        const float mid   = (float) h * 0.5f;
+        const float scale = mid * 0.92f;
+
+        for (int x = 0; x < w; ++x)
+        {
+            const int64_t s0 = (int64_t) std::floor (viewStart + (double) x * spp);
+            int64_t s1 = (int64_t) std::floor (viewStart + (double) (x + 1) * spp);
+            if (s1 <= s0) s1 = s0 + 1;
+            if (s0 >= len) break;
+            if (s0 < 0) continue;
+            if (s1 > len) s1 = len;
+
+            const int64_t stride = std::max<int64_t> (1, (s1 - s0) / 128);
+            float mn = cap[(size_t) s0], mx = mn;
+            for (int64_t j = s0; j < s1; j += stride)
+            {
+                const float v = cap[(size_t) j];
+                mn = std::min (mn, v);
+                mx = std::max (mx, v);
+            }
+
+            if (analyzed)
+            {
+                // original (tenue)
+                const float top = mid - juce::jlimit (-1.0f, 1.0f, mx) * scale;
+                const float bot = mid - juce::jlimit (-1.0f, 1.0f, mn) * scale;
+                g.setColour (juce::Colour (0xff3b4350));
+                g.fillRect ((float) x, top, 1.0f, std::max (1.0f, bot - top));
+            }
+
+            const float gain = analyzed ? gainAt (map, (s0 + s1) / 2, fade) : 1.0f;
+            const float top = mid - juce::jlimit (-1.0f, 1.0f, mx * gain) * scale;
+            const float bot = mid - juce::jlimit (-1.0f, 1.0f, mn * gain) * scale;
+            g.setColour (analyzed ? juce::Colour (0xff4cc9f0) : juce::Colour (0xff9fb3c8));
+            g.fillRect ((float) x, top, 1.0f, std::max (1.0f, bot - top));
+        }
+
+        cacheDirty = false;
+    }
+
+    //==========================================================================
+    NivelPluginProcessor& proc;
+    juce::Image cache;
+    bool cacheDirty = true;
+    bool autoFit = true;
+
+    double viewStart = 0.0;
+    double viewSpan  = 96000.0;
+    int lastDragX = 0;
+    int dragCut = -1;
+
+    uint32_t lastRev = 0xffffffffu;
+    int64_t  lastLen = -1;
+    float    lastFade = -1.0f;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (WaveformView)
+};
+
+//==============================================================================
+class NivelPluginEditor : public juce::AudioProcessorEditor, private juce::Timer
+{
+public:
+    using SliderAtt = juce::AudioProcessorValueTreeState::SliderAttachment;
+    using ButtonAtt = juce::AudioProcessorValueTreeState::ButtonAttachment;
+
+    explicit NivelPluginEditor (NivelPluginProcessor& p)
+        : juce::AudioProcessorEditor (&p), proc (p), wave (p)
+    {
+        setLookAndFeel (&lnf);
+        lnf.setColourScheme (juce::LookAndFeel_V4::getMidnightColourScheme());
+
+        captureBtn.setButtonText (T ("Capturar Audio"));
+        analyzeBtn.setButtonText ("Analizar");
+        splitBtn.setButtonText (T ("Dividir Automáticamente"));
+        clearBtn.setButtonText ("Limpiar");
+        zoomOutBtn.setButtonText ("Zoom -");
+        zoomInBtn.setButtonText ("Zoom +");
+        fitBtn.setButtonText ("Ajustar");
+        applyBtn.setButtonText ("Aplicar ganancia");
+        zeroBtn.setButtonText ("Cortes en cruce por cero");
+
+        for (auto* b : { &captureBtn, &analyzeBtn, &splitBtn, &clearBtn, &zoomOutBtn, &zoomInBtn, &fitBtn })
+            addAndMakeVisible (*b);
+        addAndMakeVisible (applyBtn);
+        addAndMakeVisible (zeroBtn);
+
+        auto setupSlider = [this] (juce::Slider& s, const juce::String& suffix)
+        {
+            s.setSliderStyle (juce::Slider::LinearHorizontal);
+            s.setTextBoxStyle (juce::Slider::TextBoxRight, false, 78, 20);
+            s.setTextValueSuffix (suffix);
+            addAndMakeVisible (s);
+        };
+        auto setupLabel = [this] (juce::Label& l, const juce::String& text)
+        {
+            l.setText (text, juce::dontSendNotification);
+            l.setJustificationType (juce::Justification::centredLeft);
+            addAndMakeVisible (l);
+        };
+
+        setupSlider (targetSlider, " dBFS");
+        setupSlider (fadeSlider,   " ms");
+        setupSlider (threshSlider, " dBFS");
+        setupSlider (minSilSlider, " ms");
+
+        setupLabel (targetLabel, "Nivel objetivo");
+        setupLabel (fadeLabel,   "Crossfade");
+        setupLabel (threshLabel, "Umbral silencio");
+        setupLabel (minSilLabel, T ("Silencio mín."));
+
+        addAndMakeVisible (wave);
+
+        targetAtt = std::make_unique<SliderAtt> (proc.apvts, "target",    targetSlider);
+        fadeAtt   = std::make_unique<SliderAtt> (proc.apvts, "fade",      fadeSlider);
+        threshAtt = std::make_unique<SliderAtt> (proc.apvts, "silthresh", threshSlider);
+        minSilAtt = std::make_unique<SliderAtt> (proc.apvts, "minsil",    minSilSlider);
+        applyAtt  = std::make_unique<ButtonAtt> (proc.apvts, "apply",     applyBtn);
+        zeroAtt   = std::make_unique<ButtonAtt> (proc.apvts, "zerocross", zeroBtn);
+
+        captureBtn.onClick = [this]
+        {
+            if (proc.isCapturing())
+                proc.stopCapture();
+            else
+            {
+                proc.startCapture();
+                wave.fitView();
+            }
+        };
+        analyzeBtn.onClick = [this] { proc.analyze(); };
+        splitBtn.onClick   = [this] { proc.autoSplit(); };
+        clearBtn.onClick   = [this] { proc.clearAll(); wave.fitView(); };
+        zoomInBtn.onClick  = [this] { wave.zoomIn(); };
+        zoomOutBtn.onClick = [this] { wave.zoomOut(); };
+        fitBtn.onClick     = [this] { wave.fitView(); };
+
+        setResizable (true, true);
+        setResizeLimits (560, 300, 2400, 1200);
+        setSize (800, 400);
+
+        startTimerHz (10);
+    }
+
+    ~NivelPluginEditor() override
+    {
+        stopTimer();
+        setLookAndFeel (nullptr);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (juce::Colour (0xff101317));
     }
 
     void resized() override
     {
-        auto area = getLocalBounds().reduced(10);
-        auto topBar = area.removeFromTop(30);
+        auto r = getLocalBounds().reduced (8);
 
-        botonGrabar.setBounds(topBar.removeFromLeft(120));
-        topBar.removeFromLeft(10);
-        botonAnalizar.setBounds(topBar.removeFromLeft(100));
-        topBar.removeFromLeft(20);
-        labelObjetivo.setBounds(topBar.removeFromLeft(150));
-        sliderObjetivo.setBounds(topBar.removeFromLeft(200));
+        auto row1 = r.removeFromTop (28);  r.removeFromTop (6);
+        auto row2 = r.removeFromTop (24);  r.removeFromTop (4);
+        auto row3 = r.removeFromTop (24);  r.removeFromTop (6);
+
+        layoutRow (row1, { { &captureBtn, 1.3f }, { &analyzeBtn, 0.9f }, { &splitBtn, 1.8f },
+                           { &clearBtn, 0.9f }, { &applyBtn, 1.5f }, { &zoomOutBtn, 0.8f },
+                           { &zoomInBtn, 0.8f }, { &fitBtn, 0.9f } }, 6);
+
+        {
+            auto left = row2.removeFromLeft (row2.getWidth() / 2 - 6);
+            row2.removeFromLeft (12);
+            placeLabelled (left, targetLabel, targetSlider, 100);
+            placeLabelled (row2, fadeLabel, fadeSlider, 100);
+        }
+        {
+            const int third = (row3.getWidth() - 24) / 3;
+            auto a = row3.removeFromLeft (third);  row3.removeFromLeft (12);
+            auto b = row3.removeFromLeft (third);  row3.removeFromLeft (12);
+            placeLabelled (a, threshLabel, threshSlider, 100);
+            placeLabelled (b, minSilLabel, minSilSlider, 100);
+            zeroBtn.setBounds (row3);
+        }
+
+        wave.setBounds (r);
     }
 
-    void timerCallback() override { repaint(); }
-
 private:
-    NivelPluginAudioProcessor& audioProcessor;
-    juce::TextButton botonGrabar { "Capturar Audio" };
-    juce::TextButton botonAnalizar { "Analizar" };
-    juce::Slider sliderObjetivo;
-    juce::Label labelObjetivo;
+    static void layoutRow (juce::Rectangle<int> row,
+                           std::initializer_list<std::pair<juce::Component*, float>> items,
+                           int gap)
+    {
+        float total = 0.0f;
+        for (const auto& it : items)
+            total += it.second;
+
+        const float avail = (float) (row.getWidth() - gap * ((int) items.size() - 1));
+        for (const auto& it : items)
+        {
+            const int w = juce::roundToInt (avail * it.second / total);
+            it.first->setBounds (row.removeFromLeft (w));
+            row.removeFromLeft (gap);
+        }
+    }
+
+    static void placeLabelled (juce::Rectangle<int> cell, juce::Label& l, juce::Slider& s, int labelW)
+    {
+        l.setBounds (cell.removeFromLeft (labelW));
+        s.setBounds (cell);
+    }
+
+    void timerCallback() override
+    {
+        const bool capturing = proc.isCapturing();
+        const auto txt = capturing ? T ("Detener captura") : T ("Capturar Audio");
+        if (captureBtn.getButtonText() != txt)
+            captureBtn.setButtonText (txt);
+
+        captureBtn.setColour (juce::TextButton::buttonColourId,
+                              capturing ? juce::Colour (0xff9b2226)
+                                        : lnf.findColour (juce::TextButton::buttonColourId));
+
+        const bool hasData = proc.isBufferValid() && proc.getCaptureLength() > 0;
+        analyzeBtn.setEnabled (hasData);
+        splitBtn.setEnabled (hasData);
+    }
+
+    juce::LookAndFeel_V4 lnf;
+    NivelPluginProcessor& proc;
+
+    juce::TextButton captureBtn, analyzeBtn, splitBtn, clearBtn, zoomOutBtn, zoomInBtn, fitBtn;
+    juce::ToggleButton applyBtn, zeroBtn;
+    juce::Slider targetSlider, fadeSlider, threshSlider, minSilSlider;
+    juce::Label targetLabel, fadeLabel, threshLabel, minSilLabel;
+    WaveformView wave;
+
+    std::unique_ptr<SliderAtt> targetAtt, fadeAtt, threshAtt, minSilAtt;
+    std::unique_ptr<ButtonAtt> applyAtt, zeroAtt;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (NivelPluginEditor)
 };
 
-juce::AudioProcessorEditor* NivelPluginAudioProcessor::createEditor()
+//==============================================================================
+juce::AudioProcessorEditor* NivelPluginProcessor::createEditor()
 {
-    return new NivelPluginAudioProcessorEditor(*this);
+    return new NivelPluginEditor (*this);
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
-    return new NivelPluginAudioProcessor();
+    return new NivelPluginProcessor();
 }

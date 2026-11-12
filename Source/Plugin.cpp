@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -16,11 +17,24 @@ namespace
     // Capacidad fija del buffer de captura (muestras). 300 s a 48 kHz.
     constexpr int64_t kMaxCaptureSamples = 48000LL * 300LL;
     constexpr int     kMaxSections       = 1024;
+    constexpr int     kMaxUndoSteps      = 100;
     constexpr float   kSilenceFloor      = 1.0e-4f;   // -80 dBFS: por debajo no se toca
     constexpr int64_t kNoPlayhead        = std::numeric_limits<int64_t>::min();
     constexpr int     kRulerH            = 18;
+    constexpr int     kScrollH           = 14;
 
     juce::String T (const char* utf8) { return juce::String::fromUTF8 (utf8); }
+
+    // m:ss.mmm (decimals = 0..3)
+    juce::String formatTime (double sec, int decimals)
+    {
+        if (sec < 0.0) sec = 0.0;
+        const int m = (int) std::floor (sec / 60.0);
+        const double s = sec - (double) m * 60.0;
+        juce::String ss = juce::String (s, decimals);
+        if (s < 10.0) ss = "0" + ss;
+        return juce::String (m) + ":" + ss;
+    }
 
     //==========================================================================
     struct GainMap
@@ -99,6 +113,7 @@ public:
         threshParam    = apvts.getRawParameterValue ("silthresh");
         minSilParam    = apvts.getRawParameterValue ("minsil");
         applyParam     = apvts.getRawParameterValue ("apply");
+        autoStopParam  = apvts.getRawParameterValue ("autostop");
     }
 
     //==========================================================================
@@ -132,6 +147,9 @@ public:
 
         layout.add (std::make_unique<AudioParameterBool> (
             ParameterID { "apply", 1 }, "Aplicar ganancia", true));
+
+        layout.add (std::make_unique<AudioParameterBool> (
+            ParameterID { "autostop", 1 }, "Detener captura al parar", true));
 
         return layout;
     }
@@ -187,6 +205,7 @@ public:
             }
         }
 
+        hostPlaying.store (playing);
         playheadIdx.store ((havePos && hasStart.load()) ? hostPos - captureStartHost.load()
                                                         : kNoPlayhead);
 
@@ -207,6 +226,12 @@ public:
                     }
                     idx = hostPos - captureStartHost.load();
                     canWrite = true;
+                }
+                else if (hasStart.load() && autoStopParam->load() > 0.5f)
+                {
+                    // el host paro: termina la captura
+                    capturing.store (false);
+                    ++revision;
                 }
             }
             else
@@ -289,6 +314,8 @@ public:
         seqPos.store (0);
         cuts.clear();
         cutsDirty = false;
+        undoStack.clear();
+        redoStack.clear();
         setGainMap (GainMap(), false);
         std::fill (capture.begin(), capture.end(), 0.0f);
         captureSR.store (currentSR.load());
@@ -311,6 +338,8 @@ public:
         seqPos.store (0);
         cuts.clear();
         cutsDirty = false;
+        undoStack.clear();
+        redoStack.clear();
         setGainMap (GainMap(), false);
         std::fill (capture.begin(), capture.end(), 0.0f);
         bufferValid.store (false);
@@ -327,6 +356,8 @@ public:
         const int64_t len = captureLen.load();
         if (len <= 0)
             return false;
+
+        pushUndo();
 
         if (zeroCrossParam->load() > 0.5f)
             for (auto& c : cuts)
@@ -378,6 +409,8 @@ public:
         if (len < win * 4)
             return;
 
+        pushUndo();
+
         const float thr = (float) juce::Decibels::decibelsToGain ((double) threshParam->load());
         const int minRun = std::max (1, (int) std::llround ((double) minSilParam->load() * 0.001 * sr / (double) hop));
 
@@ -428,6 +461,7 @@ public:
         const int64_t len = captureLen.load();
         if (pos <= 0 || pos >= len || (int) cuts.size() >= kMaxSections - 1)
             return;
+        pushUndo();
         cuts.push_back (pos);
         std::sort (cuts.begin(), cuts.end());
         cutsDirty = true;
@@ -438,10 +472,14 @@ public:
     {
         if (i < 0 || i >= (int) cuts.size())
             return;
+        pushUndo();
         cuts.erase (cuts.begin() + i);
         cutsDirty = true;
         ++revision;
     }
+
+    // Llamar una vez al empezar a arrastrar un corte (guarda un paso de deshacer)
+    void beginEdit() { pushUndo(); }
 
     void moveCut (int i, int64_t pos)
     {
@@ -476,6 +514,31 @@ public:
     }
 
     //==========================================================================
+    // Deshacer / rehacer (cortes y analisis; la captura de audio no se deshace)
+    bool canUndo() const noexcept { return ! undoStack.empty(); }
+    bool canRedo() const noexcept { return ! redoStack.empty(); }
+
+    void undo()
+    {
+        if (undoStack.empty())
+            return;
+        redoStack.push_back (makeSnapshot());
+        const Snapshot s = undoStack.back();
+        undoStack.pop_back();
+        restoreSnapshot (s);
+    }
+
+    void redo()
+    {
+        if (redoStack.empty())
+            return;
+        undoStack.push_back (makeSnapshot());
+        const Snapshot s = redoStack.back();
+        redoStack.pop_back();
+        restoreSnapshot (s);
+    }
+
+    //==========================================================================
     // Acceso de solo lectura para la GUI
     const std::vector<float>& getCapture() const noexcept { return capture; }
     int64_t  getCaptureLength() const noexcept { return captureLen.load(); }
@@ -483,6 +546,9 @@ public:
     bool     isBufferValid()    const noexcept { return bufferValid.load(); }
     bool     isAnalyzed()       const noexcept { return analyzed.load(); }
     bool     areCutsDirty()     const noexcept { return cutsDirty; }
+    bool     isHostPlaying()    const noexcept { return hostPlaying.load(); }
+    bool     isHostStartKnown() const noexcept { return hasStart.load(); }
+    int64_t  getCaptureStartHost() const noexcept { return captureStartHost.load(); }
     int64_t  getPlayheadIndex() const noexcept { return playheadIdx.load(); }
     uint32_t getRevision()      const noexcept { return revision.load(); }
     double   getSampleRate()    const noexcept { return currentSR.load(); }
@@ -582,6 +648,8 @@ public:
         for (int k = 1; k < m.count; ++k)
             cuts.push_back (m.start[k]);
 
+        undoStack.clear();
+        redoStack.clear();
         setGainMap (m, true);
         cutsDirty = false;
         ++revision;
@@ -590,6 +658,40 @@ public:
     juce::AudioProcessorValueTreeState apvts;
 
 private:
+    struct Snapshot
+    {
+        std::vector<int64_t> cuts;
+        GainMap map;
+        bool analyzed = false;
+        bool dirty = false;
+    };
+
+    Snapshot makeSnapshot() const
+    {
+        Snapshot s;
+        s.cuts     = cuts;
+        s.map      = getGainMapCopy();
+        s.analyzed = analyzed.load();
+        s.dirty    = cutsDirty;
+        return s;
+    }
+
+    void pushUndo()
+    {
+        undoStack.push_back (makeSnapshot());
+        if ((int) undoStack.size() > kMaxUndoSteps)
+            undoStack.erase (undoStack.begin());
+        redoStack.clear();
+    }
+
+    void restoreSnapshot (const Snapshot& s)
+    {
+        cuts = s.cuts;
+        setGainMap (s.map, s.analyzed);
+        cutsDirty = s.dirty;
+        ++revision;
+    }
+
     void setGainMap (const GainMap& m, bool isAnalyzed)
     {
         {
@@ -644,10 +746,13 @@ private:
     std::vector<int64_t> cuts;      // cortes interiores (solo hilo de mensajes)
     bool cutsDirty = false;
 
+    std::vector<Snapshot> undoStack, redoStack;   // solo hilo de mensajes
+
     std::atomic<bool>     capturing { false };
     std::atomic<bool>     bufferValid { false };
     std::atomic<bool>     analyzed { false };
     std::atomic<bool>     hasStart { false };
+    std::atomic<bool>     hostPlaying { false };
     std::atomic<int64_t>  captureLen { 0 };
     std::atomic<int64_t>  captureStartHost { 0 };
     std::atomic<int64_t>  seqPos { 0 };
@@ -668,21 +773,33 @@ private:
     std::atomic<float>* threshParam    = nullptr;
     std::atomic<float>* minSilParam    = nullptr;
     std::atomic<float>* applyParam     = nullptr;
+    std::atomic<float>* autoStopParam  = nullptr;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (NivelPluginProcessor)
 };
 
 //==============================================================================
-class WaveformView : public juce::Component, private juce::Timer
+class WaveformView : public juce::Component,
+                     private juce::Timer,
+                     private juce::ScrollBar::Listener
 {
 public:
     explicit WaveformView (NivelPluginProcessor& p) : proc (p)
     {
         viewSpan = proc.getSampleRate() * 2.0;
+
+        addAndMakeVisible (scrollBar);
+        scrollBar.setAutoHide (false);
+        scrollBar.addListener (this);
+
         startTimerHz (30);
     }
 
-    ~WaveformView() override { stopTimer(); }
+    ~WaveformView() override
+    {
+        stopTimer();
+        scrollBar.removeListener (this);
+    }
 
     // Zoom horizontal (eje X)
     void zoomIn()  { zoomBy (0.5, viewStart + viewSpan * 0.5); }
@@ -694,7 +811,10 @@ public:
         viewStart = 0.0;
         viewSpan  = std::max ((double) proc.getCaptureLength(), proc.getSampleRate() * 2.0);
         cacheDirty = true;
+        updateScrollBar();
     }
+
+    void setFollow (bool f) { follow = f; }
 
     //==========================================================================
     void paint (juce::Graphics& g) override
@@ -703,7 +823,8 @@ public:
 
         auto bounds = getLocalBounds();
         const auto ruler = bounds.removeFromTop (kRulerH);
-        const auto area  = bounds;
+        bounds.removeFromBottom (kScrollH);
+        const auto area = bounds;
 
         drawRuler (g, ruler);
 
@@ -783,9 +904,24 @@ public:
                                  x, (float) area.getY() + 8.0f);
                 g.fillPath (tri);
             }
+
+            // cursor (se pone haciendo clic en la regla de tiempo)
+            if (cursorIdx >= 0)
+            {
+                const float x = sampleToX ((double) cursorIdx);
+                if (x >= 0.0f && x <= (float) getWidth())
+                {
+                    g.setColour (juce::Colour (0xff7ee787));
+                    g.drawVerticalLine ((int) x, (float) ruler.getY(), (float) area.getBottom());
+                    juce::Path tri;
+                    tri.addTriangle (x - 5.0f, (float) ruler.getY(), x + 5.0f, (float) ruler.getY(),
+                                     x, (float) ruler.getBottom());
+                    g.fillPath (tri);
+                }
+            }
         }
 
-        // playhead
+        // playhead del host
         const int64_t ph = proc.getPlayheadIndex();
         if (ph != kNoPlayhead)
         {
@@ -808,22 +944,46 @@ public:
                    + T (" secciones  |  ");
             status += proc.areCutsDirty() ? T ("cortes sin analizar")
                                           : (proc.isAnalyzed() ? T ("analizado") : T ("sin analizar"));
+
+            if (cursorIdx >= 0)
+            {
+                const double off = proc.isHostStartKnown() ? (double) proc.getCaptureStartHost() / sr : 0.0;
+                status += "  |  Cursor: " + formatTime (off + (double) cursorIdx / sr, 3);
+            }
         }
+
+        auto tmp = area;
+        const auto statusR = tmp.removeFromBottom (18).reduced (6, 0);
         g.setColour (proc.isCapturing() ? juce::Colour (0xffff5c5c) : juce::Colour (0xff9aa4b1));
         g.setFont (12.0f);
-        g.drawText (status, getLocalBounds().withTrimmedTop (kRulerH).removeFromBottom (18).reduced (6, 0),
-                    juce::Justification::centredRight, false);
+        g.drawText (status, statusR, juce::Justification::centredRight, false);
     }
 
-    void resized() override { cacheDirty = true; }
+    void resized() override
+    {
+        auto b = getLocalBounds();
+        scrollBar.setBounds (b.removeFromBottom (kScrollH));
+        cacheDirty = true;
+        updateScrollBar();
+    }
 
     //==========================================================================
     void mouseDown (const juce::MouseEvent& e) override
     {
         lastDragX = e.x;
         dragCut = -1;
+        dragPushed = false;
+        draggingCursor = false;
+
         if (proc.getCaptureLength() <= 0 || ! proc.isBufferValid())
             return;
+
+        if (e.y < kRulerH && ! e.mods.isPopupMenu())
+        {
+            draggingCursor = true;
+            setCursorFromX ((float) e.x);
+            return;
+        }
 
         const int k = findCutNear ((float) e.x);
         if (e.mods.isPopupMenu())
@@ -840,8 +1000,19 @@ public:
         if (e.mods.isPopupMenu())
             return;
 
+        if (draggingCursor)
+        {
+            setCursorFromX ((float) e.x);
+            return;
+        }
+
         if (dragCut >= 0)
         {
+            if (! dragPushed)
+            {
+                proc.beginEdit();
+                dragPushed = true;
+            }
             proc.moveCut (dragCut, (int64_t) xToSample ((float) e.x));
         }
         else
@@ -855,13 +1026,17 @@ public:
 
     void mouseUp (const juce::MouseEvent&) override
     {
-        if (dragCut >= 0)
+        if (dragCut >= 0 && dragPushed)
             proc.snapCut (dragCut);
         dragCut = -1;
+        dragPushed = false;
+        draggingCursor = false;
     }
 
     void mouseDoubleClick (const juce::MouseEvent& e) override
     {
+        if (e.y < kRulerH)
+            return;
         if (proc.getCaptureLength() <= 0 || ! proc.isBufferValid())
             return;
         proc.addCut (proc.snapIfEnabled ((int64_t) xToSample ((float) e.x)));
@@ -882,6 +1057,25 @@ public:
     }
 
 private:
+    void scrollBarMoved (juce::ScrollBar*, double newRangeStart) override
+    {
+        viewStart = newRangeStart;
+        autoFit = false;
+        cacheDirty = true;
+    }
+
+    void updateScrollBar()
+    {
+        scrollBar.setRangeLimits (0.0, maxSpan());
+        scrollBar.setCurrentRange (viewStart, viewSpan, juce::dontSendNotification);
+    }
+
+    void setCursorFromX (float x)
+    {
+        const int64_t len = proc.getCaptureLength();
+        cursorIdx = juce::jlimit ((int64_t) 0, len, (int64_t) xToSample (x));
+    }
+
     double xToSample (float x) const
     {
         return viewStart + (double) x * viewSpan / (double) std::max (1, getWidth());
@@ -902,6 +1096,7 @@ private:
         viewSpan  = juce::jlimit (32.0, maxSpan(), viewSpan);
         viewStart = juce::jlimit (0.0, std::max (0.0, (double) proc.getCaptureLength() - viewSpan), viewStart);
         cacheDirty = true;
+        updateScrollBar();
     }
 
     void zoomBy (double factor, double anchor)
@@ -933,8 +1128,23 @@ private:
         const auto len = proc.getCaptureLength();
         const auto fm  = proc.getFadeMs();
 
+        if (len <= 0)
+            cursorIdx = -1;
+
         if (autoFit && len != lastLen)
             fitView();
+
+        // seguir el playhead del host cuando hay zoom
+        if (follow && ! autoFit && proc.isHostPlaying())
+        {
+            const int64_t ph = proc.getPlayheadIndex();
+            if (ph != kNoPlayhead && ph >= 0 && ph <= len
+                && ((double) ph < viewStart || (double) ph > viewStart + viewSpan))
+            {
+                viewStart = (double) ph - viewSpan * 0.1;
+                clampView();
+            }
+        }
 
         if (rev != lastRev || len != lastLen || fm != lastFade)
         {
@@ -942,6 +1152,7 @@ private:
             lastRev = rev;
             lastLen = len;
             lastFade = fm;
+            updateScrollBar();
         }
         repaint();
     }
@@ -963,18 +1174,20 @@ private:
         for (int i = 0; i < nSteps; ++i)
             if (steps[i] / secPerPx >= 70.0) { step = steps[i]; break; }
 
-        const double t0 = viewStart / sr;
-        const double t1 = (viewStart + viewSpan) / sr;
+        // la regla muestra el tiempo del host (igual que el contador del DAW)
+        const double off = proc.isHostStartKnown() ? (double) proc.getCaptureStartHost() / sr : 0.0;
+        const double t0 = off + viewStart / sr;
+        const double t1 = off + (viewStart + viewSpan) / sr;
         const int decimals = step < 0.05 ? 3 : (step < 1.0 ? 2 : 0);
 
         g.setFont (11.0f);
         for (double t = std::ceil (t0 / step) * step; t <= t1; t += step)
         {
-            const float x = (float) ((t * sr - viewStart) / viewSpan * (double) getWidth());
+            const float x = (float) ((((t - off) * sr) - viewStart) / viewSpan * (double) getWidth());
             g.setColour (juce::Colour (0xff6b7480));
             g.drawVerticalLine ((int) x, (float) r.getBottom() - 6.0f, (float) r.getBottom());
             g.setColour (juce::Colour (0xffaab2bd));
-            g.drawText (juce::String (t, decimals) + " s", (int) x + 3, r.getY(), 70, r.getHeight(),
+            g.drawText (formatTime (t, decimals), (int) x + 3, r.getY(), 80, r.getHeight(),
                         juce::Justification::centredLeft, false);
         }
     }
@@ -1036,20 +1249,85 @@ private:
 
     //==========================================================================
     NivelPluginProcessor& proc;
+    juce::ScrollBar scrollBar { false };   // barra horizontal
     juce::Image cache;
     bool cacheDirty = true;
     bool autoFit = true;
+    bool follow = true;
 
     double viewStart = 0.0;
     double viewSpan  = 96000.0;
     int lastDragX = 0;
     int dragCut = -1;
+    bool dragPushed = false;
+    bool draggingCursor = false;
+    int64_t cursorIdx = -1;
 
     uint32_t lastRev = 0xffffffffu;
     int64_t  lastLen = -1;
     float    lastFade = -1.0f;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (WaveformView)
+};
+
+//==============================================================================
+// Cuadro de confirmacion propio (sin depender de dialogos del sistema)
+class ConfirmOverlay : public juce::Component
+{
+public:
+    ConfirmOverlay()
+    {
+        yesBtn.setButtonText (T ("Sí, limpiar"));
+        noBtn.setButtonText ("Cancelar");
+        addAndMakeVisible (yesBtn);
+        addAndMakeVisible (noBtn);
+
+        yesBtn.onClick = [this] { setVisible (false); if (onYes) onYes(); };
+        noBtn.onClick  = [this] { setVisible (false); };
+    }
+
+    std::function<void()> onYes;
+
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (juce::Colours::black.withAlpha (0.6f));
+
+        auto box = boxBounds();
+        g.setColour (juce::Colour (0xff252a31));
+        g.fillRoundedRectangle (box.toFloat(), 8.0f);
+        g.setColour (juce::Colour (0xff4a5360));
+        g.drawRoundedRectangle (box.toFloat(), 8.0f, 1.0f);
+
+        auto title = box.removeFromTop (46);
+        g.setColour (juce::Colours::white);
+        g.setFont (18.0f);
+        g.drawText (T ("¿Estás seguro?"), title, juce::Justification::centred);
+
+        box.removeFromBottom (44);
+        g.setColour (juce::Colour (0xffaab2bd));
+        g.setFont (13.0f);
+        g.drawFittedText (T ("Se borrarán la captura, los cortes y el análisis.\nEsta acción no se puede deshacer."),
+                          box.reduced (14, 0), juce::Justification::centred, 3);
+    }
+
+    void resized() override
+    {
+        auto box = boxBounds();
+        auto btns = box.removeFromBottom (44).reduced (16, 8);
+        yesBtn.setBounds (btns.removeFromLeft (btns.getWidth() / 2 - 6));
+        btns.removeFromLeft (12);
+        noBtn.setBounds (btns);
+    }
+
+    void mouseDown (const juce::MouseEvent&) override {}   // bloquea lo que hay debajo
+
+private:
+    juce::Rectangle<int> boxBounds() const
+    {
+        return juce::Rectangle<int> (0, 0, 340, 150).withCentre (getLocalBounds().getCentre());
+    }
+
+    juce::TextButton yesBtn, noBtn;
 };
 
 //==============================================================================
@@ -1069,16 +1347,25 @@ public:
         analyzeBtn.setButtonText ("Analizar");
         splitBtn.setButtonText (T ("Dividir Automáticamente"));
         clearBtn.setButtonText ("Limpiar");
+        undoBtn.setButtonText ("Deshacer");
+        redoBtn.setButtonText ("Rehacer");
         zoomOutBtn.setButtonText ("Zoom -");
         zoomInBtn.setButtonText ("Zoom +");
         fitBtn.setButtonText ("Ajustar");
         applyBtn.setButtonText ("Aplicar ganancia");
         zeroBtn.setButtonText ("Cortes en cruce por cero");
+        followBtn.setButtonText ("Seguir playhead");
+        autoStopBtn.setButtonText (T ("Detener captura al parar el host"));
 
-        for (auto* b : { &captureBtn, &analyzeBtn, &splitBtn, &clearBtn, &zoomOutBtn, &zoomInBtn, &fitBtn })
+        for (auto* b : { &captureBtn, &analyzeBtn, &splitBtn, &clearBtn, &undoBtn, &redoBtn,
+                         &zoomOutBtn, &zoomInBtn, &fitBtn })
             addAndMakeVisible (*b);
         addAndMakeVisible (applyBtn);
         addAndMakeVisible (zeroBtn);
+        addAndMakeVisible (followBtn);
+        addAndMakeVisible (autoStopBtn);
+
+        followBtn.setToggleState (true, juce::dontSendNotification);
 
         auto setupSlider = [this] (juce::Slider& s, const juce::String& suffix)
         {
@@ -1106,12 +1393,13 @@ public:
 
         addAndMakeVisible (wave);
 
-        targetAtt = std::make_unique<SliderAtt> (proc.apvts, "target",    targetSlider);
-        fadeAtt   = std::make_unique<SliderAtt> (proc.apvts, "fade",      fadeSlider);
-        threshAtt = std::make_unique<SliderAtt> (proc.apvts, "silthresh", threshSlider);
-        minSilAtt = std::make_unique<SliderAtt> (proc.apvts, "minsil",    minSilSlider);
-        applyAtt  = std::make_unique<ButtonAtt> (proc.apvts, "apply",     applyBtn);
-        zeroAtt   = std::make_unique<ButtonAtt> (proc.apvts, "zerocross", zeroBtn);
+        targetAtt   = std::make_unique<SliderAtt> (proc.apvts, "target",    targetSlider);
+        fadeAtt     = std::make_unique<SliderAtt> (proc.apvts, "fade",      fadeSlider);
+        threshAtt   = std::make_unique<SliderAtt> (proc.apvts, "silthresh", threshSlider);
+        minSilAtt   = std::make_unique<SliderAtt> (proc.apvts, "minsil",    minSilSlider);
+        applyAtt    = std::make_unique<ButtonAtt> (proc.apvts, "apply",     applyBtn);
+        zeroAtt     = std::make_unique<ButtonAtt> (proc.apvts, "zerocross", zeroBtn);
+        autoStopAtt = std::make_unique<ButtonAtt> (proc.apvts, "autostop",  autoStopBtn);
 
         captureBtn.onClick = [this]
         {
@@ -1125,10 +1413,33 @@ public:
         };
         analyzeBtn.onClick = [this] { proc.analyze(); };
         splitBtn.onClick   = [this] { proc.autoSplit(); };
-        clearBtn.onClick   = [this] { proc.clearAll(); wave.fitView(); };
+        undoBtn.onClick    = [this] { proc.undo(); };
+        redoBtn.onClick    = [this] { proc.redo(); };
         zoomInBtn.onClick  = [this] { wave.zoomIn(); };
         zoomOutBtn.onClick = [this] { wave.zoomOut(); };
         fitBtn.onClick     = [this] { wave.fitView(); };
+        followBtn.onClick  = [this] { wave.setFollow (followBtn.getToggleState()); };
+
+        clearBtn.onClick = [this]
+        {
+            if (proc.getCaptureLength() > 0 || proc.isAnalyzed())
+            {
+                confirm.setVisible (true);
+                confirm.toFront (false);
+            }
+            else
+            {
+                proc.clearAll();
+                wave.fitView();
+            }
+        };
+
+        confirm.onYes = [this]
+        {
+            proc.clearAll();
+            wave.fitView();
+        };
+        addChildComponent (confirm);   // siempre el ultimo: queda encima de todo
 
         setResizable (true, true);
         setResizeLimits (560, 300, 2400, 1200);
@@ -1152,15 +1463,17 @@ public:
     {
         auto r = getLocalBounds().reduced (8);
 
-        auto row1 = r.removeFromTop (28);  r.removeFromTop (6);
+        auto row1 = r.removeFromTop (28);  r.removeFromTop (4);
         auto row2 = r.removeFromTop (24);  r.removeFromTop (4);
-        auto row3 = r.removeFromTop (24);  r.removeFromTop (6);
+        auto row3 = r.removeFromTop (24);  r.removeFromTop (4);
+        auto row4 = r.removeFromTop (24);  r.removeFromTop (6);
 
         layoutRow (row1, { { &captureBtn, 1.3f }, { &analyzeBtn, 0.9f }, { &splitBtn, 1.8f },
-                           { &clearBtn, 0.9f }, { &applyBtn, 1.5f }, { &zoomOutBtn, 0.8f },
-                           { &zoomInBtn, 0.8f }, { &fitBtn, 0.9f } }, 6);
+                           { &clearBtn, 0.9f }, { &undoBtn, 1.0f }, { &redoBtn, 1.0f } }, 6);
 
         {
+            applyBtn.setBounds (row2.removeFromRight (150));
+            row2.removeFromRight (8);
             auto left = row2.removeFromLeft (row2.getWidth() / 2 - 6);
             row2.removeFromLeft (12);
             placeLabelled (left, targetLabel, targetSlider, 100);
@@ -1175,7 +1488,11 @@ public:
             zeroBtn.setBounds (row3);
         }
 
+        layoutRow (row4, { { &zoomOutBtn, 0.8f }, { &zoomInBtn, 0.8f }, { &fitBtn, 0.9f },
+                           { &followBtn, 1.4f }, { &autoStopBtn, 2.2f } }, 6);
+
         wave.setBounds (r);
+        confirm.setBounds (getLocalBounds());
     }
 
 private:
@@ -1216,19 +1533,23 @@ private:
         const bool hasData = proc.isBufferValid() && proc.getCaptureLength() > 0;
         analyzeBtn.setEnabled (hasData);
         splitBtn.setEnabled (hasData);
+        undoBtn.setEnabled (proc.canUndo());
+        redoBtn.setEnabled (proc.canRedo());
     }
 
     juce::LookAndFeel_V4 lnf;
     NivelPluginProcessor& proc;
 
-    juce::TextButton captureBtn, analyzeBtn, splitBtn, clearBtn, zoomOutBtn, zoomInBtn, fitBtn;
-    juce::ToggleButton applyBtn, zeroBtn;
+    juce::TextButton captureBtn, analyzeBtn, splitBtn, clearBtn, undoBtn, redoBtn,
+                     zoomOutBtn, zoomInBtn, fitBtn;
+    juce::ToggleButton applyBtn, zeroBtn, followBtn, autoStopBtn;
     juce::Slider targetSlider, fadeSlider, threshSlider, minSilSlider;
     juce::Label targetLabel, fadeLabel, threshLabel, minSilLabel;
     WaveformView wave;
+    ConfirmOverlay confirm;
 
     std::unique_ptr<SliderAtt> targetAtt, fadeAtt, threshAtt, minSilAtt;
-    std::unique_ptr<ButtonAtt> applyAtt, zeroAtt;
+    std::unique_ptr<ButtonAtt> applyAtt, zeroAtt, autoStopAtt;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (NivelPluginEditor)
 };
